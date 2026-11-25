@@ -23,13 +23,15 @@ int main(int argc, char **argv) {
     SDL_Renderer *r = SDL_CreateSoftwareRenderer(s);
     if (!ui_init(r, font, n)) { fprintf(stderr, "ui_init failed\n"); return 1; }
 
-    UiCard cards[4] = {
-        { "Switch 2 / Switch", "Wired Pro Controller with motion", "Switch 2 · Switch · Steam", UI_ICON_SWITCH, 0xff4554 },
-        { "Xbox controller", "Nothing to install on the PC", "Windows · Linux · Steam", UI_ICON_XBOX, 0x3ccf4e },
-        { "Generic gamepad", "Standard USB gamepad, no motion", "PC · Mac · Android", UI_ICON_GAMEPAD, 0x4c9dff },
-        { "PC over Wi-Fi", "No cable, needs the PC receiver", "Windows · Mac · Linux", UI_ICON_WIFI, 0xb57bff },
+    UiCard cards[6] = {
+        { "Switch 2 / Switch", "Wired Pro Controller with motion", "USB · Switch 2 · Steam",   UI_ICON_SWITCH,  0xff4554 },
+        { "Xbox controller",   "Nothing to install on the PC",     "USB · Windows · Linux",    UI_ICON_XBOX,    0x3ccf4e },
+        { "Wii U (Cemu)",      "GamePad with touch and motion",    "Wi-Fi · Cemu on PC",       UI_ICON_TABLET,  0x26c6da },
+        { "Generic gamepad",   "Standard USB gamepad, no motion",  "USB · PC · Mac · Android", UI_ICON_GAMEPAD, 0x4c9dff },
+        { "PC over Wi-Fi",     "No cable, needs the PC receiver",  "Wi-Fi · Windows · Linux",  UI_ICON_WIFI,    0xb57bff },
+        { "Settings",          "Motion, latency, layout, tools",   "",                         UI_ICON_WRENCH,  0x9aa3b5 },
     };
-    UiHome h = { "1.1.0", cards, 4, 0, NULL };
+    UiHome h = { "1.2.0", cards, 6, 2, NULL };
     ui_draw_home(&h); save(r, s, argv[2], "1_home");
 
     UiRun v = { .title = "Switch 2 / Switch", .icon = UI_ICON_SWITCH, .accent = 0xff4554,
@@ -41,16 +43,25 @@ int main(int argc, char **argv) {
         .stat_text = "48211 reports", .quit_progress = 0.0f };
     ui_draw_run(&v, 0); save(r, s, argv[2], "2_run_switch");
 
+    UiRun c = { .title = "Wii U (Cemu)", .icon = UI_ICON_TABLET, .accent = 0x26c6da,
+        .status = UI_ST_CONNECTED, .status_text = "Connected - play!",
+        .lines = { "Touch this screen to touch the GamePad", "In Cemu: Options > Separate GamePad view,\nor swap screens so the GamePad is shown", "HOME is - plus a right-stick click", NULL },
+        .buttons = UIB_ZL, .lsx = -12000, .lsy = 25000,
+        .show_motion = true, .motion_text = "Console motion sensor", .accel = { 0.1f, -0.2f, 0.97f },
+        .touch_passthrough = true, .touching = true, .touch_x = 980, .touch_y = 210,
+        .stat_text = "PC 192.168.1.20  ·  round trip 4.1 ms" };
+    ui_draw_run(&c, 0); save(r, s, argv[2], "2b_run_cemu");
+
     UiRun w = { .title = "PC over Wi-Fi", .icon = UI_ICON_WIFI, .accent = 0xb57bff,
         .status = UI_ST_WAITING, .status_text = "Looking for the receiver...",
         .lines = { "Run PadLink Receiver on the PC", "Keep both on the same network", NULL },
         .stat_text = "RTT 4.2 ms typical", .quit_progress = 0.45f };
     ui_draw_run(&w, 300); save(r, s, argv[2], "3_run_wifi");
 
-    const char *names[8] = { "Motion source", "Tilt axis X", "Tilt axis Y", "Tilt axis Z", "Gyro sensitivity", "Latency", "Xbox face buttons", "Start automatically" };
-    const char *vals[8] = { "Auto", "Normal", "Inverted", "Normal", "1.00x", "Lowest", "By position", "Off" };
-    const char *help[8] = { "Auto uses the controller's motion sensor if it has one (Joy-Cons),\notherwise the console's own sensor (Split Pad Pro).", 0,0,0,0,0,0,0 };
-    UiList l = { "Settings", names, vals, help, 8, 0, NULL };
+    const char *names[9] = { "Motion source", "Tilt axis X", "Tilt axis Y", "Tilt axis Z", "Gyro sensitivity", "Latency", "Xbox face buttons", "Start automatically", "Advanced tools" };
+    const char *vals[9] = { "Auto", "Normal", "Inverted", "Normal", "1.00x", "Lowest", "By position", "Off", NULL };
+    const char *help[9] = { "Auto uses the controller's motion sensor if it has one (Joy-Cons),\notherwise the console's own sensor (Split Pad Pro).", 0,0,0,0,0,0,0,0 };
+    UiList l = { "Settings", names, vals, help, 9, 0, NULL };
     ui_draw_list(&l); save(r, s, argv[2], "4_settings");
 
     UiError e = { "Couldn't start USB", "Close DBI, Goldleaf, Tinfoil or anything else\nthat uses USB, then try again.", "Error 0x2A2  ·  details in sdmc:/switch/padlink/padlink.log" };

@@ -1,2 +1,2 @@
 #pragma once
-#define PADLINK_APP_VERSION "1.1.0"
+#define PADLINK_APP_VERSION "1.2.0"

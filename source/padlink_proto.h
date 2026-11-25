@@ -11,6 +11,7 @@
 
 #define PADLINK_TYPE_STATE 0x01   // Switch -> PC: controller state
 #define PADLINK_TYPE_ECHO  0x02   // PC -> Switch: echo of a state packet (Wi-Fi only, for RTT)
+#define PADLINK_TYPE_STATE_MOTION 0x03 // Switch -> PC: PadlinkMotionPacket (state + motion)
 
 #define PADLINK_FLAG_TOUCH 0x0001 // touch_x / touch_y are valid
 
@@ -32,3 +33,13 @@ typedef struct __attribute__((packed)) {
 } PadlinkPacket;
 
 _Static_assert(sizeof(PadlinkPacket) == 36, "PadlinkPacket must be 36 bytes");
+
+// Cemu mode: the state plus motion, in Pro Controller axes after the Settings
+// (invert / sensitivity). The receiver serves it to Cemu over the DSU protocol.
+typedef struct __attribute__((packed)) {
+    PadlinkPacket base;       // base.type = PADLINK_TYPE_STATE_MOTION
+    float accel_g[3];         // G
+    float gyro_dps[3];        // degrees per second
+} PadlinkMotionPacket;
+
+_Static_assert(sizeof(PadlinkMotionPacket) == 60, "PadlinkMotionPacket must be 60 bytes");

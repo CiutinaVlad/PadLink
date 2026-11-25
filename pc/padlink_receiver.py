@@ -6,6 +6,7 @@ virtual gamepad.
   Wi-Fi (default):   python padlink_receiver.py
   USB:               python padlink_receiver.py --usb
   Just print input:  python padlink_receiver.py --backend print
+  Wii U in Cemu:     python padlink_receiver.py --cemu
 
 Virtual gamepad backends:
   Windows: vgamepad (Xbox 360 pad via ViGEmBus)   pip install vgamepad
@@ -16,14 +17,22 @@ USB mode also needs:  pip install pyusb libusb-package   (Windows: WinUSB driver
 Every 5 s it prints MEASURED stats: packet rate, lost packets (sequence gaps), and the
 spread of packet arrival times (jitter). In Wi-Fi mode it also echoes every packet back
 so the Switch screen shows the measured round-trip time.
+
+Cemu mode (--cemu, Switch app mode "Wii U (Cemu)"): buttons, sticks and motion are
+served to Cemu over the DSU ("cemuhook") protocol on 127.0.0.1:26760, so no driver
+is needed on any OS. Touching the Switch screen moves and clicks the mouse on Cemu's
+GamePad view (Windows: found automatically; macOS/Linux: pip install pynput).
 """
-import argparse, socket, struct, sys, time, platform, statistics
+import argparse, socket, struct, sys, time, platform, statistics, threading, zlib
 
 PORT = 47111
 FMT = "<2sBBIIhhhhHHHHQ"          # matches PadlinkPacket in padlink_proto.h (36 bytes)
 SIZE = struct.calcsize(FMT)
 assert SIZE == 36
-TYPE_STATE, TYPE_ECHO = 1, 2
+TYPE_STATE, TYPE_ECHO, TYPE_STATE_MOTION = 1, 2, 3
+MOTION_FMT = "<6f"                   # PadlinkMotionPacket tail: accel G xyz, gyro deg/s xyz
+MOTION_SIZE = SIZE + struct.calcsize(MOTION_FMT)
+assert MOTION_SIZE == 60
 FLAG_TOUCH = 1
 
 # libnx HidNpadButton bits
@@ -31,13 +40,18 @@ A, B, X, Y, LS, RS, L, R, ZL, ZR, PLUS, MINUS, LEFT, UP, RIGHT, DOWN = range(16)
 
 
 def parse(data):
-    if len(data) != SIZE:
+    if len(data) not in (SIZE, MOTION_SIZE):
         return None
-    m, ver, typ, seq, btn, lx, ly, rx, ry, tx, ty, flags, _res, t_us = struct.unpack(FMT, data)
+    m, ver, typ, seq, btn, lx, ly, rx, ry, tx, ty, flags, _res, t_us = struct.unpack(FMT, data[:SIZE])
     if m != b"PL" or ver != 1:
         return None
-    return dict(type=typ, seq=seq, buttons=btn, lx=lx, ly=ly, rx=rx, ry=ry,
-                touch=(tx, ty) if flags & FLAG_TOUCH else None, t_us=t_us)
+    s = dict(type=typ, seq=seq, buttons=btn, lx=lx, ly=ly, rx=rx, ry=ry,
+             touch=(tx, ty) if flags & FLAG_TOUCH else None, t_us=t_us, accel=None, gyro=None)
+    if typ == TYPE_STATE_MOTION and len(data) == MOTION_SIZE:
+        v = struct.unpack(MOTION_FMT, data[SIZE:])
+        s["accel"], s["gyro"] = v[:3], v[3:]
+        s["type"] = TYPE_STATE
+    return s
 
 
 # ------------------------------------------------------------------ backends --
@@ -132,7 +146,239 @@ class UinputBackend:
         self.ui.close()
 
 
+# ------------------------------------------------------------------- Cemu ----
+
+class DsuServer:
+    """Serves one controller over the DSU / cemuhook protocol (UDP 26760), the motion
+    and controller input Cemu (and Dolphin, Yuzu-likes...) understand natively.
+    Packets: 16-byte header 'DSUS' + version 1001 + payload length + CRC32 + server id,
+    then a message type and the payload."""
+    PROTO, T_VERSION, T_PORTS, T_DATA = 1001, 0x100000, 0x100001, 0x100002
+    MAC = bytes([0x7C, 0xBB, 0x8A, 0x50, 0x4C, 0x4B])
+
+    def __init__(self, host, port, motion_map):
+        self.sk = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sk.bind((host, port))
+        self.sk.settimeout(0.5)
+        self.server_id = int(time.time()) & 0xFFFFFFFF
+        self.clients = {}              # addr -> last time it asked for data
+        self.lock = threading.Lock()
+        self.n = 0
+        self.connected = False
+        self.map = motion_map
+        threading.Thread(target=self._rx, daemon=True).start()
+        print(f"DSU server for Cemu on {host}:{port}. In Cemu: Input settings > Controller API "
+              f"'DSUController', host 127.0.0.1, port {port}, then pick controller 1.")
+
+    def _send(self, payload, addr):
+        msg = bytearray(b"DSUS" + struct.pack("<HHII", self.PROTO, len(payload), 0, self.server_id) + payload)
+        struct.pack_into("<I", msg, 8, zlib.crc32(msg) & 0xFFFFFFFF)
+        try:
+            self.sk.sendto(bytes(msg), addr)
+        except OSError:
+            pass
+
+    def _shared(self, slot):
+        on = slot == 0 and self.connected
+        # slot, state (2 = connected), model (2 = full gyro), connection (1 = USB), MAC, battery (5 = full)
+        return struct.pack("<BBBB6sB", slot, 2 if on else 0, 2 if on else 0, 1 if on else 0,
+                           self.MAC if on else bytes(6), 5 if on else 0)
+
+    def _rx(self):
+        while True:
+            try:
+                data, addr = self.sk.recvfrom(128)
+            except socket.timeout:
+                continue
+            except OSError:
+                continue
+            if len(data) < 20 or data[:4] != b"DSUC":
+                continue
+            (typ,) = struct.unpack_from("<I", data, 16)
+            if typ == self.T_VERSION:
+                self._send(struct.pack("<IH", self.T_VERSION, self.PROTO), addr)
+            elif typ == self.T_PORTS and len(data) >= 24:
+                (count,) = struct.unpack_from("<i", data, 20)
+                for slot in data[24:24 + max(0, min(count, 4))]:
+                    self._send(struct.pack("<I", self.T_PORTS) + self._shared(slot) + b"\0", addr)
+            elif typ == self.T_DATA:
+                with self.lock:
+                    if addr not in self.clients:
+                        print(f"Cemu connected to the DSU server from {addr[0]}:{addr[1]}")
+                    self.clients[addr] = time.monotonic()
+
+    def _motion(self, s):
+        if not s["accel"]:
+            return (0.0, -1.0, 0.0), (0.0, 0.0, 0.0)
+        def pick(vec, spec):
+            out = []
+            for term in spec:
+                sign = -1.0 if term.startswith("-") else 1.0
+                out.append(sign * vec["xyz".index(term[-1])])
+            return tuple(out)
+        return pick(s["accel"], self.map[0]), pick(s["gyro"], self.map[1])
+
+    def update(self, s):
+        self.connected = True
+        b = s["buttons"]
+        bit = lambda i: b >> i & 1
+        home = bit(MINUS) and bit(RS)                     # HOME = - plus right-stick click
+        if home:
+            b &= ~((1 << MINUS) | (1 << RS))
+            bit = lambda i: b >> i & 1
+        # buttons1: Left Down Right Up Options R3 L3 Share   buttons2: Square Cross Circle Triangle R1 L1 R2 L2
+        b1 = (bit(LEFT) << 7 | bit(DOWN) << 6 | bit(RIGHT) << 5 | bit(UP) << 4 |
+              bit(PLUS) << 3 | bit(RS) << 2 | bit(LS) << 1 | bit(MINUS))
+        # by position: Switch Y (west) = Square, B (south) = Cross, A (east) = Circle, X (north) = Triangle
+        b2 = (bit(Y) << 7 | bit(B) << 6 | bit(A) << 5 | bit(X) << 4 |
+              bit(R) << 3 | bit(L) << 2 | bit(ZR) << 1 | bit(ZL))
+        st = lambda v: max(0, min(255, 128 + v // 256))   # libnx: +Y up, DSU: +Y up
+        an = lambda i: 255 if bit(i) else 0
+        analog = bytes([an(LEFT), an(DOWN), an(RIGHT), an(UP), an(Y), an(B), an(A), an(X),
+                        an(R), an(L), an(ZR), an(ZL)])
+        t = s["touch"]
+        touch = (struct.pack("<BBHH", 1, 0, t[0], t[1]) if t else bytes(6)) + bytes(6)
+        acc, gyr = self._motion(s)
+        self.n += 1
+        payload = (struct.pack("<I", self.T_DATA) + self._shared(0) +
+                   struct.pack("<BI", 1, self.n) +
+                   bytes([b1, b2, 1 if home else 0, 1 if t else 0,
+                          st(s["lx"]), st(s["ly"]), st(s["rx"]), st(s["ry"])]) +
+                   analog + touch +
+                   struct.pack("<Q6f", int(time.monotonic() * 1e6), *acc, *gyr))
+        assert len(payload) == 84
+        now = time.monotonic()
+        with self.lock:
+            for addr, seen in list(self.clients.items()):
+                if now - seen > 5.0:                       # Cemu re-asks every second or so
+                    del self.clients[addr]
+                else:
+                    self._send(payload, addr)
+
+    def close(self):
+        self.connected = False
+
+
+class TouchMouse:
+    """Switch touchscreen -> mouse on Cemu's GamePad view (16:9 area of the window)."""
+    def __init__(self, args):
+        self.rect_arg = args.touch_rect
+        self.down = False
+        self.rect = None
+        self.rect_t = 0.0
+        self.win = platform.system() == "Windows"
+        self.ok = True
+        if self.win:
+            import ctypes
+            from ctypes import wintypes
+            self.ct, self.wt = ctypes, wintypes
+            self.u32 = ctypes.windll.user32
+            try:
+                ctypes.windll.shcore.SetProcessDpiAwareness(2)
+            except Exception:
+                self.u32.SetProcessDPIAware()
+        else:
+            try:
+                from pynput.mouse import Controller, Button
+                self.mouse, self.btn = Controller(), Button.left
+            except Exception as ex:
+                print(f"Touch disabled ({ex}). For touch: pip install pynput")
+                self.ok = False
+
+    def _find_rect(self):
+        if self.rect_arg:
+            return tuple(int(v) for v in self.rect_arg.split(","))
+        if self.win:
+            ct, wt, u32 = self.ct, self.wt, self.u32
+            found = {}
+            def cb(hwnd, _):
+                if not u32.IsWindowVisible(hwnd):
+                    return True
+                n = u32.GetWindowTextLengthW(hwnd)
+                buf = ct.create_unicode_buffer(n + 1)
+                u32.GetWindowTextW(hwnd, buf, n + 1)
+                title = buf.value
+                if "GamePad View" in title:
+                    found["pad"] = hwnd
+                elif title.startswith("Cemu") and "main" not in found:
+                    found["main"] = hwnd
+                return True
+            u32.EnumWindows(ct.WINFUNCTYPE(wt.BOOL, wt.HWND, wt.LPARAM)(cb), 0)
+            hwnd = found.get("pad") or found.get("main")
+            if not hwnd:
+                return None
+            r = wt.RECT(); u32.GetClientRect(hwnd, ct.byref(r))
+            p = wt.POINT(0, 0); u32.ClientToScreen(hwnd, ct.byref(p))
+            return (p.x, p.y, r.right, r.bottom)
+        try:
+            import tkinter
+            tk = tkinter.Tk(); w, h = tk.winfo_screenwidth(), tk.winfo_screenheight(); tk.destroy()
+            return (0, 0, w, h)
+        except Exception:
+            return (0, 0, 1920, 1080)
+
+    def _map(self, tx, ty):
+        now = time.monotonic()
+        if not self.down and (self.rect is None or now - self.rect_t > 2.0):
+            self.rect = self._find_rect(); self.rect_t = now
+        if not self.rect:
+            return None
+        x, y, w, h = self.rect
+        vw, vh = (w, w * 9 // 16) if w * 9 <= h * 16 else (h * 16 // 9, h)   # letterboxed 16:9
+        x += (w - vw) // 2; y += (h - vh) // 2
+        return x + tx * vw // 1280, y + ty * vh // 720
+
+    def update(self, s):
+        if not self.ok:
+            return
+        t = s["touch"]
+        if t:
+            pos = self._map(*t)
+            if not pos:
+                return
+            if self.win:
+                self.u32.SetCursorPos(*pos)
+                if not self.down:
+                    self.u32.mouse_event(0x0002, 0, 0, 0, 0)       # left down
+            else:
+                self.mouse.position = pos
+                if not self.down:
+                    self.mouse.press(self.btn)
+            self.down = True
+        elif self.down:
+            if self.win:
+                self.u32.mouse_event(0x0004, 0, 0, 0, 0)           # left up
+            else:
+                self.mouse.release(self.btn)
+            self.down = False
+
+    def close(self):
+        if self.down:
+            self.update(dict(touch=None))
+
+
+class CemuBackend:
+    def __init__(self, args):
+        acc, gyr = args.motion_map.split(";")
+        self.dsu = DsuServer(args.dsu_host, args.dsu_port, (acc.split(","), gyr.split(",")))
+        self.touch = TouchMouse(args)
+        self.motion_seen = False
+
+    def update(self, s):
+        if s["accel"] and not self.motion_seen:
+            print("Receiving motion from the Switch.")
+            self.motion_seen = True
+        self.dsu.update(s)
+        self.touch.update(s)
+
+    def close(self):
+        self.touch.close()
+        self.dsu.close()
+
+
 def make_backend(args):
+    if args.cemu:
+        return CemuBackend(args)
     name = args.backend
     if name == "auto":
         name = {"Windows": "vigem", "Linux": "uinput"}.get(platform.system(), "print")
@@ -215,7 +461,7 @@ def run_udp(args, backend, stats):
         s = parse(data)
         if not s or s["type"] != TYPE_STATE:
             continue
-        sk.sendto(data[:3] + bytes([TYPE_ECHO]) + data[4:], addr)    # echo for RTT on the Switch
+        sk.sendto(data[:3] + bytes([TYPE_ECHO]) + data[4:SIZE], addr)  # echo for RTT on the Switch
         if addr != peer:
             print(f"Switch connected from {addr[0]}")
             peer = addr
@@ -276,6 +522,14 @@ def main():
     ap.add_argument("--label-layout", action="store_true",
                     help="map Switch A->Xbox A by letter (default: by position, Switch A->Xbox B)")
     ap.add_argument("--csv", help="write every packet's arrival time to this CSV file")
+    ap.add_argument("--cemu", action="store_true",
+                    help="Wii U in Cemu: serve DSU (buttons, sticks, motion) and map touch to the GamePad view")
+    ap.add_argument("--dsu-host", default="127.0.0.1", help="DSU server address (0.0.0.0 to allow other PCs)")
+    ap.add_argument("--dsu-port", type=int, default=26760)
+    ap.add_argument("--motion-map", default="y,-z,x;y,z,x",
+                    help="Pro Controller axes -> DSU axes, 'accel;gyro' (default %(default)s). "
+                         "Easier: flip the Tilt axis settings on the Switch.")
+    ap.add_argument("--touch-rect", help="x,y,w,h of the GamePad view on screen (default: find Cemu's window)")
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
     backend = make_backend(args)

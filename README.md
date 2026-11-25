@@ -17,6 +17,18 @@ Use your Hori Split Pad Pro or Joy-Cons, with motion controls.</p>
 | **Steam (any PC)** | Pro Controller, with motion | Nothing |
 | **Mac or anything else** | Generic USB gamepad | Nothing |
 | **PC over Wi-Fi** | Xbox controller | The small PadLink PC receiver |
+| **Wii U games in Cemu** | Wii U GamePad: buttons, motion **and touchscreen** | The PadLink PC receiver with `--cemu` |
+
+## Wii U games (Cemu)
+
+<p align="center"><img src="docs/screen_run_cemu.png" width="640" alt="PadLink in Wii U (Cemu) mode"></p>
+
+1. On the PC: download **`PadLink-PC-receiver.zip`**, unzip it and run `python padlink_receiver.py --cemu`
+   (for touch on macOS/Linux also `pip install pynput`; Windows needs nothing extra).
+2. In Cemu: **Options > Input settings**, Controller API **DSUController**, IP `127.0.0.1`, port `26760`, pick controller 1 and map the buttons. Turn on **Options > Separate GamePad view** for touch.
+3. On the Switch: pick **Wii U (Cemu)**. Your buttons, sticks and tilt go to Cemu, and touching the Switch screen touches the GamePad screen.
+
+Tilt the wrong way? Flip **Settings > Tilt axis X/Y/Z** on the Switch.
 
 ## Install (2 minutes)
 

@@ -17,7 +17,7 @@ enum {
     UIB_LEFT = 1 << 12, UIB_UP = 1 << 13, UIB_RIGHT = 1 << 14, UIB_DOWN = 1 << 15,
 };
 
-typedef enum { UI_ICON_SWITCH, UI_ICON_XBOX, UI_ICON_GAMEPAD, UI_ICON_WIFI, UI_ICON_USB, UI_ICON_WRENCH } UiIcon;
+typedef enum { UI_ICON_SWITCH, UI_ICON_XBOX, UI_ICON_GAMEPAD, UI_ICON_WIFI, UI_ICON_USB, UI_ICON_WRENCH, UI_ICON_TABLET } UiIcon;
 
 typedef enum { UI_ST_STARTING, UI_ST_WAITING, UI_ST_CONNECTING, UI_ST_CONNECTED } UiStatus;
 
@@ -30,8 +30,8 @@ typedef struct {
 
 typedef struct {
     const char *version;
-    const UiCard *cards; int ncards;       // 4
-    int sel;                               // 0..ncards-1 cards, ncards = Settings, ncards+1 = Advanced
+    const UiCard *cards; int ncards;       // up to 6, 2 columns
+    int sel;                               // 0..ncards-1
     const char *toast;                     // optional message line, NULL for none
 } UiHome;
 
@@ -46,6 +46,8 @@ typedef struct {
     int lsx, lsy, rsx, rsy;                // -32768..32767
     // motion (Switch mode)
     bool show_motion;
+    bool touch_passthrough;                // Cemu: screen touches go to the PC, no Stop button
+    bool touching; int touch_x, touch_y;
     const char *motion_text;               // "console", "controller", ...
     float accel[3];                        // in G, any orientation; drawn as tilt
     // footer
@@ -74,6 +76,6 @@ void ui_draw_list(const UiList *l);
 void ui_draw_error(const UiError *e);
 
 // Touch hit testing for the last drawn screen. Returns an item index or -1.
-// Home: 0..3 cards, 4 Settings, 5 Advanced, 6 Quit.  Run: 0 = Stop button.
+// Home: card index, or 6 = Quit.  Run: 0 = Stop button.
 // List: row index, or 1000 + row for the "<" arrow, 2000 + row for ">", 9999 = Back.
 int ui_hit(int x, int y);

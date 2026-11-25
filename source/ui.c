@@ -229,6 +229,14 @@ static void icon(UiIcon ic, int cx, int cy, int s, uint32_t c) {
             boxRGBA(R, cx + s / 5 - s / 14, cy - s / 9 - s / 7, cx + s / 5 + s / 14, cy - s / 9 - 2, RGBA(c, 255));
             break;
         }
+        case UI_ICON_TABLET: {      // GamePad-style tablet: wide body, screen, two sticks
+            int w = s * 86 / 100, h = s * 50 / 100;
+            rbox(cx - w / 2, cy - h / 2, w, h, h / 3, c, 255);
+            rbox(cx - w / 4 - 2, cy - h / 2 + 6, w / 2 + 4, h - 12, 3, PANEL, 255);
+            disc(cx - w / 2 + w / 9, cy - h / 6, s / 16 + 1, PANEL, 255);
+            disc(cx + w / 2 - w / 9, cy - h / 6, s / 16 + 1, PANEL, 255);
+            break;
+        }
         case UI_ICON_WRENCH: {      // gear
             int ro = s * 34 / 100, ri = s * 14 / 100;
             for (int i = 0; i < 8; i++) {
@@ -312,40 +320,29 @@ void ui_draw_home(const UiHome *h) {
     rbox(UI_W - 64 - vw, 48, vw, 32, 16, PANEL, 255);
     text(FONT(F18, 0), v, UI_W - 64 - vw / 2, 64, DIM, AL_CENTER);
 
-    const int cw = 566, ch = 196, gx = 20, gy = 20, x0 = 64, y0 = 136;
-    for (int i = 0; i < h->ncards && i < 4; i++) {
+    // 2 columns x 3 rows of cards
+    const int cw = 566, ch = 136, gx = 20, gy = 14, x0 = 64, y0 = 124;
+    for (int i = 0; i < h->ncards && i < 6; i++) {
         const UiCard *c = &h->cards[i];
         int x = x0 + (i % 2) * (cw + gx), y = y0 + (i / 2) * (ch + gy);
         bool sel = h->sel == i;
         rbox(x, y, cw, ch, 22, sel ? PANEL_HI : PANEL, 255);
         if (sel) rframe(x - 4, y - 4, cw + 8, ch + 8, 26, 4, c->accent, 255);
-        disc(x + 86, y + ch / 2, 54, mix(PANEL, c->accent, sel ? 0.35f : 0.22f), 255);
-        icon(c->icon, x + 86, y + ch / 2, 66, c->accent);
-        text(FONT(F32, 1), c->title, x + 168, y + 54, TEXT, AL_LEFT);
-        text(FONT(F22, 0), c->subtitle, x + 168, y + 96, DIM, AL_LEFT);
-        int tw = text_w(FONT(F18, 1), c->tag) + 28;
-        rbox(x + 166, y + 128, tw, 34, 17, mix(PANEL, c->accent, 0.18f), 255);
-        text(FONT(F18, 1), c->tag, x + 166 + tw / 2, y + 145, mix(c->accent, TEXT, 0.35f), AL_CENTER);
+        disc(x + 74, y + ch / 2, 46, mix(PANEL, c->accent, sel ? 0.35f : 0.22f), 255);
+        icon(c->icon, x + 74, y + ch / 2, 58, c->accent);
+        text(FONT(F32, 1), c->title, x + 146, y + 36, TEXT, AL_LEFT);
+        text(FONT(F22, 0), c->subtitle, x + 146, y + 72, DIM, AL_LEFT);
+        if (c->tag && *c->tag) {
+            int tw = text_w(FONT(F18, 1), c->tag) + 24;
+            rbox(x + 144, y + 92, tw, 30, 15, mix(PANEL, c->accent, 0.18f), 255);
+            text(FONT(F18, 1), c->tag, x + 144 + tw / 2, y + 107, mix(c->accent, TEXT, 0.35f), AL_CENTER);
+        }
         hit_add(x, y, cw, ch, i);
-    }
-
-    // secondary buttons
-    static const char *labels[2] = { "Settings", "Advanced" };
-    static const UiIcon icons[2] = { UI_ICON_WRENCH, UI_ICON_USB };
-    int by = y0 + 2 * (ch + gy) + 6;
-    for (int i = 0; i < 2; i++) {
-        int bx = x0 + i * 236, bw = 216, bh = 60;
-        bool sel = h->sel == h->ncards + i;
-        rbox(bx, by, bw, bh, 30, sel ? PANEL_HI : PANEL, 255);
-        if (sel) rframe(bx - 4, by - 4, bw + 8, bh + 8, 34, 4, TEXT, 255);
-        icon(icons[i], bx + 38, by + bh / 2, 30, sel ? TEXT : DIM);
-        text(FONT(F22, 1), labels[i], bx + 66, by + bh / 2, sel ? TEXT : DIM, AL_LEFT);
-        hit_add(bx, by, bw, bh, 4 + i);
     }
 
     footer_bar();
     if (h->toast) text(FONT(F22, 0), h->toast, 64, UI_H - 36, WARN, AL_LEFT);
-    static const char *const hp[] = { "A", "Start", "Y", "Settings", "+", "Quit" };
+    static const char *const hp[] = { "A", "Select", "Y", "Settings", "+", "Quit" };
     hints(hp, 3, UI_W - 64, UI_H - 36);
     hit_add(UI_W - 150, UI_H - 72, 150, 72, 6);
     SDL_RenderPresent(R);
@@ -474,14 +471,22 @@ void ui_draw_run(const UiRun *v, uint32_t ms) {
     text(FONT(F22, 0), "and", 104, fy, DIM, AL_LEFT);
     hint_glyph(150, fy, "-", TEXT);
     text(FONT(F22, 0), "hold 2 s to stop", 190, fy, DIM, AL_LEFT);
-    int pbx = 370, pbw = 200;
+    int pbx = 370, pbw = 150;
     rbox(pbx, fy - 5, pbw, 10, 5, LINE, 255);
     if (v->quit_progress > 0.01f) rbox(pbx, fy - 5, (int)(pbw * (v->quit_progress > 1 ? 1 : v->quit_progress)), 10, 5, BAD, 255);
-    if (v->stat_text) text(FONT(F18, 0), v->stat_text, 900, fy, FAINT, AL_RIGHT);
-    int sbw = 150;
-    rbox(UI_W - 64 - sbw, fy - 24, sbw, 48, 24, mix(PANEL, BAD, 0.25f), 255);
-    text(FONT(F22, 1), "Stop", UI_W - 64 - sbw / 2, fy, 0xffb3b3, AL_CENTER);
-    hit_add(UI_W - 64 - sbw - 10, fy - 34, sbw + 20, 68, 0);
+    if (v->stat_text) text(FONT(F18, 0), v->stat_text, v->touch_passthrough ? 860 : 900, fy, FAINT, AL_RIGHT);
+    if (v->touch_passthrough) {
+        text(FONT(F18, 1), "TOUCH GOES TO THE GAMEPAD", UI_W - 64, fy, v->touching ? v->accent : FAINT, AL_RIGHT);
+        if (v->touching) {   // show where the GamePad screen is being touched
+            ring(v->touch_x, v->touch_y, 34, 3, v->accent, 200);
+            disc(v->touch_x, v->touch_y, 8, v->accent, 200);
+        }
+    } else {
+        int sbw = 150;
+        rbox(UI_W - 64 - sbw, fy - 24, sbw, 48, 24, mix(PANEL, BAD, 0.25f), 255);
+        text(FONT(F22, 1), "Stop", UI_W - 64 - sbw / 2, fy, 0xffb3b3, AL_CENTER);
+        hit_add(UI_W - 64 - sbw - 10, fy - 34, sbw + 20, 68, 0);
+    }
     SDL_RenderPresent(R);
 }
 
@@ -495,7 +500,7 @@ void ui_draw_list(const UiList *l) {
     hit_add(40, 20, 80, 72, 9999);
     text(FONT(F44, 1), l->title, 112, 56, TEXT, AL_LEFT);
 
-    const int x = 64, w = UI_W - 128, rh = 50, y0 = 108;
+    const int x = 64, w = UI_W - 128, rh = l->n > 8 ? 44 : 50, y0 = 108;
     for (int i = 0; i < l->n; i++) {
         int y = y0 + i * (rh + 6);
         bool sel = i == l->sel;

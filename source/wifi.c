@@ -94,11 +94,13 @@ void wifiExit(void) {
     if (s_nifm_up) { nifmExit(); s_nifm_up = false; }
 }
 
-Result wifiSend(const PadlinkPacket *pkt) {
+Result wifiSend(const PadlinkPacket *pkt) { return wifiSendRaw(pkt, sizeof *pkt); }
+
+Result wifiSendRaw(const void *pkt, size_t len) {
     if (s_sock < 0) return MAKERESULT(Module_Libnx, LibnxError_NotInitialized);
     const struct sockaddr_in *dst = s_peer_known ? &s_peer : &s_bcast;
-    ssize_t n = sendto(s_sock, pkt, sizeof *pkt, 0, (const struct sockaddr *)dst, sizeof *dst);
-    if (n != (ssize_t)sizeof *pkt) { s_send_errors++; return MAKERESULT(Module_Libnx, LibnxError_IoError); }
+    ssize_t n = sendto(s_sock, pkt, len, 0, (const struct sockaddr *)dst, sizeof *dst);
+    if (n != (ssize_t)len) { s_send_errors++; return MAKERESULT(Module_Libnx, LibnxError_IoError); }
     s_sent++;
     // PC went quiet for 3 s (receiver restarted?): fall back to broadcast discovery.
     if (s_peer_known && !s_fixed_peer && now_us() - s_last_echo_us > 3000000ULL) {
@@ -111,10 +113,13 @@ Result wifiSend(const PadlinkPacket *pkt) {
 void wifiPoll(void) {
     if (s_sock < 0) return;
     for (int i = 0; i < 64; i++) {
+        union { PadlinkPacket p; u8 raw[128]; } u;
         PadlinkPacket p;
         struct sockaddr_in from; socklen_t fl = sizeof from;
-        ssize_t n = recvfrom(s_sock, &p, sizeof p, 0, (struct sockaddr *)&from, &fl);
-        if (n != (ssize_t)sizeof p) break;
+        ssize_t n = recvfrom(s_sock, &u, sizeof u, 0, (struct sockaddr *)&from, &fl);
+        if (n < 0) break;
+        if (n < (ssize_t)sizeof p) continue;
+        p = u.p;
         if (p.magic0 != PADLINK_MAGIC0 || p.magic1 != PADLINK_MAGIC1 || p.type != PADLINK_TYPE_ECHO) continue;
         u64 t = now_us();
         s_last_echo_us = t;

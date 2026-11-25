@@ -12,5 +12,6 @@ typedef struct {
 Result wifiInit(void);
 void   wifiExit(void);
 Result wifiSend(const PadlinkPacket *pkt);
+Result wifiSendRaw(const void *pkt, size_t len);
 void   wifiPoll(void);                 // reads echoes, non-blocking
 void   wifiGetStats(WifiStats *out);

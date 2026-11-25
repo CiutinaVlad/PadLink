@@ -40,7 +40,7 @@ include $(DEVKITPRO)/libnx/switch_rules
 TARGET		:=	padlink
 APP_TITLE	:=	PadLink
 APP_AUTHOR	:=	PadLink
-APP_VERSION	:=	1.1.0
+APP_VERSION	:=	1.2.0
 BUILD		:=	build
 SOURCES		:=	source
 DATA		:=	data

@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.2.0
+- New: **Wii U (Cemu)** mode. Buttons, sticks, motion and the touchscreen act as the Wii U GamePad in Cemu (receiver: `--cemu`, DSU protocol, touch goes to Cemu's GamePad view).
+- Home screen shows all modes as cards; Advanced tools moved into Settings.
+- Motion code shared between the Switch 2 and Cemu modes.
+
 ## 1.1.0
 - Real graphical interface: mode cards, big connection status, live view of buttons, sticks and tilt, touch support everywhere.
 - Controller forwarding now runs on its own high-priority thread, so drawing the screen never adds latency.

@@ -18,6 +18,7 @@
 #include "usb_hid.h"
 #include "usb_vendor.h"
 #include "wifi.h"
+#include "motion.h"
 #include "ui.h"
 
 // ------------------------------------------------------------------ modes ---
@@ -26,24 +27,29 @@ typedef enum {
     MODE_XBOX,         // XInput over USB (Windows / Linux)
     MODE_GAMEPAD,      // generic USB HID gamepad
     MODE_WIFI,         // UDP to the PC receiver
+    MODE_CEMU,         // Wi-Fi + motion + touch to the PC receiver, served to Cemu (Wii U)
     MODE_VENDOR,       // advanced: USB to the PC receiver
     MODE_HIDTEST,      // advanced: USB HID descriptors only (crash test)
     MODE_COUNT
 } Mode;
 
-static const UiCard k_cards[4] = {
-    { "Switch 2 / Switch", "Wired Pro Controller with motion", "Switch 2 · Switch · Steam", UI_ICON_SWITCH, 0xff4554 },
-    { "Xbox controller",   "Nothing to install on the PC",     "Windows · Linux · Steam",   UI_ICON_XBOX,   0x3ccf4e },
-    { "Generic gamepad",   "Standard USB gamepad, no motion",  "PC · Mac · Android",        UI_ICON_GAMEPAD, 0x4c9dff },
-    { "PC over Wi-Fi",     "No cable, needs the PC receiver",  "Windows · Mac · Linux",     UI_ICON_WIFI,   0xb57bff },
+#define NCARDS 6
+static const UiCard k_cards[NCARDS] = {
+    { "Switch 2 / Switch", "Wired Pro Controller with motion", "USB · Switch 2 · Steam",   UI_ICON_SWITCH,  0xff4554 },
+    { "Xbox controller",   "Nothing to install on the PC",     "USB · Windows · Linux",    UI_ICON_XBOX,    0x3ccf4e },
+    { "Wii U (Cemu)",      "GamePad with touch and motion",    "Wi-Fi · Cemu on PC",       UI_ICON_TABLET,  0x26c6da },
+    { "Generic gamepad",   "Standard USB gamepad, no motion",  "USB · PC · Mac · Android", UI_ICON_GAMEPAD, 0x4c9dff },
+    { "PC over Wi-Fi",     "No cable, needs the PC receiver",  "Wi-Fi · Windows · Linux",  UI_ICON_WIFI,    0xb57bff },
+    { "Settings",          "Motion, latency, layout, tools",   "",                         UI_ICON_WRENCH,  0x9aa3b5 },
 };
+static const int k_card_mode[NCARDS] = { MODE_SWITCH, MODE_XBOX, MODE_CEMU, MODE_GAMEPAD, MODE_WIFI, -1 };
 static const char *k_mode_title[MODE_COUNT] = {
-    "Switch 2 / Switch", "Xbox controller", "Generic gamepad", "PC over Wi-Fi", "USB to PC receiver", "USB HID test",
+    "Switch 2 / Switch", "Xbox controller", "Generic gamepad", "PC over Wi-Fi", "Wii U (Cemu)", "USB to PC receiver", "USB HID test",
 };
 static const UiIcon k_mode_icon[MODE_COUNT] = {
-    UI_ICON_SWITCH, UI_ICON_XBOX, UI_ICON_GAMEPAD, UI_ICON_WIFI, UI_ICON_USB, UI_ICON_WRENCH,
+    UI_ICON_SWITCH, UI_ICON_XBOX, UI_ICON_GAMEPAD, UI_ICON_WIFI, UI_ICON_TABLET, UI_ICON_USB, UI_ICON_WRENCH,
 };
-static const uint32_t k_mode_accent[MODE_COUNT] = { 0xff4554, 0x3ccf4e, 0x4c9dff, 0xb57bff, 0x4cc2ff, 0xf5b942 };
+static const uint32_t k_mode_accent[MODE_COUNT] = { 0xff4554, 0x3ccf4e, 0x4c9dff, 0xb57bff, 0x26c6da, 0x4cc2ff, 0xf5b942 };
 
 static u64 now_us(void) { return armTicksToNs(armGetSystemTick()) / 1000ULL; }
 
@@ -93,6 +99,11 @@ static Result mode_start(Mode m) {
         case MODE_XBOX:    return xinputInit();
         case MODE_GAMEPAD: return usbHidInit(2);
         case MODE_WIFI:    return wifiInit();
+        case MODE_CEMU: {
+            Result rc = wifiInit();
+            if (R_SUCCEEDED(rc)) motionStart();
+            return rc;
+        }
         case MODE_VENDOR:  return usbVendorInit();
         case MODE_HIDTEST: return usbHidInit(1);
         default:           return 0;
@@ -105,6 +116,7 @@ static void mode_stop(Mode m) {
         case MODE_XBOX:    xinputExit(); break;
         case MODE_GAMEPAD: case MODE_HIDTEST: usbHidExit(); break;
         case MODE_WIFI:    wifiExit(); break;
+        case MODE_CEMU:    motionStop(); wifiExit(); break;
         case MODE_VENDOR:  usbVendorExit(); break;
         default: break;
     }
@@ -128,6 +140,7 @@ static void worker_main(void *arg) {
     padInitializeDefault(&pad);
     InputState in;
     PadlinkPacket pkt;
+    PadlinkMotionPacket mpkt;
     u32 seq = 0;
     bool dirty = true;
     u64 last_send = 0, last_share = 0, quit_since = 0;
@@ -148,6 +161,19 @@ static void worker_main(void *arg) {
         switch (m) {
             case MODE_SWITCH: src = proconUpdate(&in); break;
             case MODE_XBOX:   src = xinputUpdate(&in); break;
+            case MODE_CEMU:
+                motionUpdate();
+                if (dirty || t - last_send >= 4000) {     // 250 Hz motion, buttons right away
+                    inputToPacket(&in, &mpkt.base, seq++);
+                    mpkt.base.type = PADLINK_TYPE_STATE_MOTION;
+                    float ma[3], mg[3];
+                    motionGet(ma, mg);
+                    memcpy(mpkt.accel_g, ma, sizeof ma); memcpy(mpkt.gyro_dps, mg, sizeof mg);
+                    src = wifiSendRaw(&mpkt, sizeof mpkt);
+                    last_send = t; dirty = false;
+                    wifiPoll();
+                }
+                break;
             case MODE_WIFI:
                 if (dirty || t - last_send >= 4000) {
                     inputToPacket(&in, &pkt, seq++);
@@ -249,12 +275,34 @@ static void fill_run_view(Mode m, UiRun *v, char *stat, size_t stat_n, char *st,
             else { v->status = UI_ST_WAITING; v->status_text = "Plug in and start the receiver"; }
             v->lines[0] = "On the PC: python padlink_receiver.py --usb";
             break;
+        case MODE_CEMU: {
+            WifiStats w; wifiGetStats(&w);
+            float g[3];
+            v->show_motion = true;
+            v->motion_text = motion_label(motionActiveSource());
+            motionGetRaw(v->accel, g);
+            v->touch_passthrough = true;
+            v->touching = in.touch; v->touch_x = in.touch_x; v->touch_y = in.touch_y;
+            if (w.peer_known) {
+                (void)st; (void)st_n;
+                v->status = UI_ST_CONNECTED; v->status_text = "Connected - play!";
+                snprintf(stat, stat_n, "PC %s  ·  round trip %.1f ms", w.peer_ip, w.rtt_median_ms);
+                v->lines[0] = "Touch this screen to touch the GamePad";
+                v->lines[1] = "In Cemu: Options > Separate GamePad view,\nor swap screens so the GamePad is shown";
+                v->lines[2] = "HOME is - plus a right-stick click";
+            } else {
+                v->status = UI_ST_WAITING; v->status_text = "Looking for the receiver...";
+                v->lines[0] = "On the PC run: padlink_receiver.py --cemu";
+                v->lines[1] = "In Cemu input settings pick DSUController,\n127.0.0.1 port 26760";
+                v->lines[2] = "Keep the Switch and the PC on the same network";
+            }
+            break;
+        }
         case MODE_WIFI: {
             WifiStats w; wifiGetStats(&w);
             if (w.peer_known) {
-                snprintf(st, st_n, "Connected to %s", w.peer_ip);
-                v->status = UI_ST_CONNECTED; v->status_text = st;
-                snprintf(stat, stat_n, "Round trip %.1f ms typical, %.1f ms worst", w.rtt_median_ms, w.rtt_max_ms);
+                v->status = UI_ST_CONNECTED; v->status_text = "Connected - play!";
+                snprintf(stat, stat_n, "PC %s  ·  round trip %.1f ms (worst %.0f)", w.peer_ip, w.rtt_median_ms, w.rtt_max_ms);
             } else {
                 v->status = UI_ST_WAITING; v->status_text = "Looking for the receiver...";
             }
@@ -293,7 +341,7 @@ static void run_mode(Mode m) {
     while (!W.done) {
         UiInput in = ui_poll();
         if (s_quit_app) W.stop = true;
-        if (in.tap && ui_hit(in.tap_x, in.tap_y) == 0) W.stop = true;
+        if (in.tap && m != MODE_CEMU && ui_hit(in.tap_x, in.tap_y) == 0) W.stop = true;
         UiRun v; memset(&v, 0, sizeof v);
         fill_run_view(m, &v, stat, sizeof stat, st, sizeof st);
         ui_draw_run(&v, SDL_GetTicks() - t0);
@@ -305,16 +353,19 @@ static void run_mode(Mode m) {
         char d[96];
         snprintf(d, sizeof d, "Error 0x%X (%04d-%04d)  ·  log: sdmc:/switch/padlink/padlink.log",
                  (unsigned)W.start_rc, 2000 + R_MODULE(W.start_rc), R_DESCRIPTION(W.start_rc));
-        if (m == MODE_WIFI) error_screen("Couldn't start Wi-Fi", "Is the Switch connected to a Wi-Fi network?", d);
+        if (m == MODE_WIFI || m == MODE_CEMU) error_screen("Couldn't start Wi-Fi", "Is the Switch connected to a Wi-Fi network?", d);
         else error_screen("Couldn't start USB", "Close DBI, Goldleaf, Tinfoil or anything else\nthat uses USB, then try again.", d);
     }
 }
 
 // --------------------------------------------------------------- settings ---
+static void advanced_screen(void);
 static void settings_screen(void) {
-    static const char *names[8] = { "Motion source", "Tilt axis X", "Tilt axis Y", "Tilt axis Z",
-                                    "Gyro sensitivity", "Latency", "Xbox face buttons", "Start automatically" };
-    static const char *help[8] = {
+    enum { N = 9 };
+    static const char *names[N] = { "Motion source", "Tilt axis X", "Tilt axis Y", "Tilt axis Z",
+                                    "Gyro sensitivity", "Latency", "Xbox face buttons", "Start automatically",
+                                    "Advanced tools" };
+    static const char *help[N] = {
         "Auto uses the controller's motion sensor if it has one (Joy-Cons),\notherwise the console's own sensor (Split Pad Pro).",
         "Flip this if tilting goes the wrong way on this axis.",
         "Flip this if tilting goes the wrong way on this axis.",
@@ -323,26 +374,28 @@ static void settings_screen(void) {
         "Lowest sends a fresh report at every USB poll. Standard behaves exactly\nlike a real Pro Controller (8 ms). Use it if something acts up.",
         "By position: the bottom button is always Xbox A.\nBy label: the Switch A button is Xbox A.",
         "Skip the menu and start the last used mode right away.\nHold B while PadLink starts to get the menu back.",
+        "USB to the PC receiver, and a USB test for troubleshooting crashes.",
     };
     int sel = 0;
     while (!s_quit_app) {
-        char v[8][32];
-        const char *vals[8];
+        char v[N][32];
+        const char *vals[N];
         snprintf(v[0], 32, "%s", motionSourceName(g_settings.motion));
         for (int i = 0; i < 3; i++) snprintf(v[1 + i], 32, "%s", g_settings.invert[i] ? "Inverted" : "Normal");
         snprintf(v[4], 32, "%.2fx", g_settings.gyro_scale);
         snprintf(v[5], 32, "%s", g_settings.low_latency ? "Lowest" : "Standard");
         snprintf(v[6], 32, "%s", g_settings.xbox_layout == LAYOUT_LABEL ? "By label" : "By position");
         snprintf(v[7], 32, "%s", g_settings.autostart ? "Last used mode" : "Off");
-        for (int i = 0; i < 8; i++) vals[i] = v[i];
+        for (int i = 0; i < N - 1; i++) vals[i] = v[i];
+        vals[N - 1] = NULL;
 
-        UiList l = { "Settings", names, vals, help, 8, sel, NULL };
+        UiList l = { "Settings", names, vals, help, N, sel, NULL };
         ui_draw_list(&l);
 
         UiInput in = ui_poll();
         int dir = (in.down & (HidNpadButton_AnyRight | HidNpadButton_A)) ? 1 : (in.down & HidNpadButton_AnyLeft) ? -1 : 0;
-        if (in.down & HidNpadButton_AnyUp)   sel = (sel + 7) % 8;
-        if (in.down & HidNpadButton_AnyDown) sel = (sel + 1) % 8;
+        if (in.down & HidNpadButton_AnyUp)   sel = (sel + N - 1) % N;
+        if (in.down & HidNpadButton_AnyDown) sel = (sel + 1) % N;
         if (in.tap) {
             int h = ui_hit(in.tap_x, in.tap_y);
             if (h == 9999) break;
@@ -351,6 +404,10 @@ static void settings_screen(void) {
             else if (h >= 0) { if (h == sel) dir = 1; sel = h; }
         }
         if (in.down & HidNpadButton_B) break;
+        if (sel == N - 1) {
+            if ((in.down & HidNpadButton_A) || (in.tap && dir)) advanced_screen();
+            dir = 0;
+        }
         if (dir) {
             switch (sel) {
                 case 0: g_settings.motion = (MotionSource)((g_settings.motion + MOTION_COUNT + dir) % MOTION_COUNT); break;
@@ -417,27 +474,29 @@ int main(void) {
     // Autostart: go straight to the last mode unless B is held at launch.
     padUpdate(&s_pad);
     if (g_settings.autostart && !(padGetButtons(&s_pad) & HidNpadButton_B) &&
-        g_settings.last_mode >= 0 && g_settings.last_mode <= MODE_WIFI)
+        g_settings.last_mode >= 0 && g_settings.last_mode <= MODE_CEMU)
         run_mode((Mode)g_settings.last_mode);
 
-    int sel = (g_settings.last_mode >= 0 && g_settings.last_mode <= MODE_WIFI) ? g_settings.last_mode : 0;
+    int sel = 0;
+    for (int i = 0; i < NCARDS; i++) if (k_card_mode[i] == g_settings.last_mode) sel = i;
     while (!s_quit_app) {
-        UiHome h = { PADLINK_APP_VERSION, k_cards, 4, sel, NULL };
+        UiHome h = { PADLINK_APP_VERSION, k_cards, NCARDS, sel, NULL };
         ui_draw_home(&h);
         UiInput in = ui_poll();
-        // grid: 0 1 / 2 3 / 4 5 (Settings, Advanced)
+        // grid: 0 1 / 2 3 / 4 5 (5 = Settings)
         if (in.down & HidNpadButton_AnyLeft)  sel = (sel % 2) ? sel - 1 : sel;
         if (in.down & HidNpadButton_AnyRight) sel = (sel % 2) ? sel : sel + 1;
         if (in.down & HidNpadButton_AnyUp)    sel = sel >= 2 ? sel - 2 : sel;
-        if (in.down & HidNpadButton_AnyDown)  sel = sel <= 3 ? sel + 2 : sel;
+        if (in.down & HidNpadButton_AnyDown)  sel = sel + 2 < NCARDS ? sel + 2 : sel;
         int act = (in.down & HidNpadButton_A) ? sel : -1;
-        if (in.down & HidNpadButton_Y) act = 4;
+        if (in.down & HidNpadButton_Y) act = NCARDS - 1;
         if (in.down & HidNpadButton_Plus) act = 6;
-        if (in.tap) { int t = ui_hit(in.tap_x, in.tap_y); if (t >= 0) { act = t; if (t < 6) sel = t; } }
+        if (in.tap) { int t = ui_hit(in.tap_x, in.tap_y); if (t >= 0) { act = t; if (t < NCARDS) sel = t; } }
         if (act == 6) break;
-        if (act >= 0 && act < 4) run_mode((Mode)act);
-        else if (act == 4) settings_screen();
-        else if (act == 5) advanced_screen();
+        if (act >= 0 && act < NCARDS) {
+            if (k_card_mode[act] >= 0) run_mode((Mode)k_card_mode[act]);
+            else settings_screen();
+        }
     }
 
     ui_exit();

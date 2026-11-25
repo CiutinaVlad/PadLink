@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.1.0
+- Real graphical interface: mode cards, big connection status, live view of buttons, sticks and tilt, touch support everywhere.
+- Controller forwarding now runs on its own high-priority thread, so drawing the screen never adds latency.
+- Clearer error screens (for example when another app is using USB).
+
 ## 1.0.0
 - New on-screen menu and Settings screen. No config files to edit.
 - Switch 2 / Switch: wired Pro Controller with motion. Auto-detects whether the controller has a motion sensor and falls back to the console's sensor (Split Pad Pro). Gyro drift calibration.

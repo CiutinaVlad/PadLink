@@ -1,9 +1,14 @@
 // PadLink - use a modded Nintendo Switch (Split Pad Pro / Joy-Cons) as a USB
 // controller for a Switch 2, a Switch, or a PC.
-// Run it as a full-RAM title (hold R while starting a game).
+//
+// Threads: the main thread draws the SDL2 UI (vsync'd, 60 fps). While a mode
+// runs, a separate higher-priority worker thread reads the controllers and feeds
+// USB / Wi-Fi every 0.5 ms, so drawing never adds latency.
+#include <math.h>
 #include <stdio.h>
 #include <string.h>
 #include <switch.h>
+#include <SDL2/SDL.h>
 #include "version.h"
 #include "log.h"
 #include "settings.h"
@@ -13,6 +18,7 @@
 #include "usb_hid.h"
 #include "usb_vendor.h"
 #include "wifi.h"
+#include "ui.h"
 
 // ------------------------------------------------------------------ modes ---
 typedef enum {
@@ -25,135 +31,62 @@ typedef enum {
     MODE_COUNT
 } Mode;
 
+static const UiCard k_cards[4] = {
+    { "Switch 2 / Switch", "Wired Pro Controller with motion", "Switch 2 · Switch · Steam", UI_ICON_SWITCH, 0xff4554 },
+    { "Xbox controller",   "Nothing to install on the PC",     "Windows · Linux · Steam",   UI_ICON_XBOX,   0x3ccf4e },
+    { "Generic gamepad",   "Standard USB gamepad, no motion",  "PC · Mac · Android",        UI_ICON_GAMEPAD, 0x4c9dff },
+    { "PC over Wi-Fi",     "No cable, needs the PC receiver",  "Windows · Mac · Linux",     UI_ICON_WIFI,   0xb57bff },
+};
 static const char *k_mode_title[MODE_COUNT] = {
-    "Switch 2 / Switch", "PC - Xbox controller", "PC / Mac - Generic gamepad",
-    "PC - Wi-Fi", "USB to PC receiver", "USB HID crash test",
+    "Switch 2 / Switch", "Xbox controller", "Generic gamepad", "PC over Wi-Fi", "USB to PC receiver", "USB HID test",
 };
-
-static const char *k_mode_help[MODE_COUNT] = {
-    "Acts as a wired Pro Controller: buttons, sticks and motion.\n"
-    "  On the Switch 2 turn on: Settings > Controllers & Accessories >\n"
-    "  Pro Controller Wired Communication. Also works with Steam on a PC.",
-    "Acts as a wired Xbox controller. Windows and Linux have the driver\n"
-    "  built in: nothing to install. Works with Steam and most PC games.",
-    "Acts as a standard USB gamepad. Basic support everywhere,\n"
-    "  including macOS. No motion.",
-    "No cable. Run the PadLink receiver on the PC (see the GitHub page)\n"
-    "  and keep both on the same network.",
-    "For testing: sends to padlink_receiver.py --usb on a PC.",
-    "For troubleshooting USB crashes: descriptors only, no gamepad.",
+static const UiIcon k_mode_icon[MODE_COUNT] = {
+    UI_ICON_SWITCH, UI_ICON_XBOX, UI_ICON_GAMEPAD, UI_ICON_WIFI, UI_ICON_USB, UI_ICON_WRENCH,
 };
-
-// --------------------------------------------------------------------- UI ---
-#define C_RESET  "\x1b[0m"
-#define C_TITLE  "\x1b[1;37;44m"
-#define C_SEL    "\x1b[30;46m"
-#define C_DIM    "\x1b[37m"
-#define C_OK     "\x1b[1;32m"
-#define C_WARN   "\x1b[1;33m"
-#define C_ACCENT "\x1b[1;36m"
-
-static void ui_header(const char *sub) {
-    printf("\x1b[2J\x1b[1;1H");
-    printf(C_TITLE " PadLink %-6s%-65s" C_RESET "\n", PADLINK_APP_VERSION, sub);
-    printf("\n");
-}
-
-static void ui_footer(const char *text) {
-    printf("\x1b[44;1H" C_DIM " %s" C_RESET, text);
-}
-
-static void ui_flush(void) { logLock(); consoleUpdate(NULL); logUnlock(); }
+static const uint32_t k_mode_accent[MODE_COUNT] = { 0xff4554, 0x3ccf4e, 0x4c9dff, 0xb57bff, 0x4cc2ff, 0xf5b942 };
 
 static u64 now_us(void) { return armTicksToNs(armGetSystemTick()) / 1000ULL; }
 
-// Generic vertical menu. Returns the chosen index, or -1 for B.
-static int ui_menu(PadState *pad, const char *sub, const char **items, const char **help, int n, int sel) {
-    bool redraw = true;
-    while (appletMainLoop()) {
-        if (redraw) {
-            ui_header(sub);
-            for (int i = 0; i < n; i++)
-                printf("  %s %-40s " C_RESET "\n\n", i == sel ? C_SEL ">" : " ", items[i]);
-            if (help && help[sel]) printf("\x1b[30;1H" C_ACCENT "  %s" C_RESET "\n", help[sel]);
-            ui_footer("Up/Down: choose    A: select    B: back");
-            ui_flush();
-            redraw = false;
+// ---------------------------------------------------------- input helpers ---
+static PadState s_pad;          // UI thread's pad (menus only)
+static bool s_quit_app;         // HOME > close, or Quit
+
+typedef struct { u64 down; int tap_x, tap_y; bool tap; } UiInput;
+
+// Pumps SDL events (needed for the applet loop and touch) and reads buttons,
+// with key repeat on the D-pad / left stick.
+static UiInput ui_poll(void) {
+    static u64 held_since, last_rep;
+    UiInput in = { 0 };
+    SDL_Event ev;
+    while (SDL_PollEvent(&ev)) {
+        if (ev.type == SDL_QUIT) s_quit_app = true;
+        else if (ev.type == SDL_FINGERDOWN) {
+            in.tap = true; in.tap_x = (int)(ev.tfinger.x * UI_W); in.tap_y = (int)(ev.tfinger.y * UI_H);
         }
-        padUpdate(pad);
-        u64 d = padGetButtonsDown(pad);
-        if (d & (HidNpadButton_AnyUp))   { sel = (sel + n - 1) % n; redraw = true; }
-        if (d & (HidNpadButton_AnyDown)) { sel = (sel + 1) % n; redraw = true; }
-        if (d & HidNpadButton_A) return sel;
-        if (d & HidNpadButton_B) return -1;
-        svcSleepThread(16000000ULL);
     }
-    return -1;
+    padUpdate(&s_pad);
+    in.down = padGetButtonsDown(&s_pad);
+    const u64 dirs = HidNpadButton_AnyUp | HidNpadButton_AnyDown | HidNpadButton_AnyLeft | HidNpadButton_AnyRight;
+    u64 held = padGetButtons(&s_pad) & dirs, t = now_us();
+    if (!held) held_since = 0;
+    else if (in.down & dirs) { held_since = t; last_rep = t; }
+    else if (held_since && t - held_since > 400000 && t - last_rep > 110000) { in.down |= held; last_rep = t; }
+    return in;
 }
 
-// ---------------------------------------------------------------- settings --
-static void settings_screen(PadState *pad) {
-    int sel = 0;
-    const int n = 8;
-    bool redraw = true;
-    while (appletMainLoop()) {
-        if (redraw) {
-            char v[8][40];
-            snprintf(v[0], 40, "%s", motionSourceName(g_settings.motion));
-            snprintf(v[1], 40, "%s", g_settings.invert[0] ? "Inverted" : "Normal");
-            snprintf(v[2], 40, "%s", g_settings.invert[1] ? "Inverted" : "Normal");
-            snprintf(v[3], 40, "%s", g_settings.invert[2] ? "Inverted" : "Normal");
-            snprintf(v[4], 40, "%.2fx", g_settings.gyro_scale);
-            snprintf(v[5], 40, "%s", g_settings.low_latency ? "Lowest" : "Standard (8 ms)");
-            snprintf(v[6], 40, "%s", g_settings.xbox_layout == LAYOUT_LABEL ? "By label (A = A)" : "By position");
-            snprintf(v[7], 40, "%s", g_settings.autostart ? "Last used mode" : "Off");
-            static const char *names[8] = { "Motion source", "Tilt axis X", "Tilt axis Y", "Tilt axis Z",
-                                            "Gyro sensitivity", "Latency", "Xbox face buttons", "Start automatically" };
-            static const char *help[8] = {
-                "Auto uses the controller's motion sensor if it has one (Joy-Cons),\n  otherwise the console's own sensor (Split Pad Pro).",
-                "Flip this if tilting goes the wrong way on one axis.",
-                "Flip this if tilting goes the wrong way on one axis.",
-                "Flip this if tilting goes the wrong way on one axis.",
-                "How strongly turning the Switch turns the camera.",
-                "Lowest sends a fresh report at every USB poll. Standard behaves\n  exactly like a real Pro Controller (use it if something acts up).",
-                "By position: the bottom button is always Xbox A.\n  By label: the Switch A button is Xbox A.",
-                "Skip this menu next time and start the last mode right away.\n  Hold B while PadLink starts to get the menu back.",
-            };
-            ui_header("Settings");
-            for (int i = 0; i < n; i++)
-                printf("  %s %-22s %-24s " C_RESET "\n\n", i == sel ? C_SEL ">" : " ", names[i], v[i]);
-            printf("\x1b[30;1H" C_ACCENT "  %s" C_RESET "\n", help[sel]);
-            ui_footer("Up/Down: choose    Left/Right or A: change    B: save and go back");
-            ui_flush();
-            redraw = false;
-        }
-        padUpdate(pad);
-        u64 d = padGetButtonsDown(pad);
-        int dir = (d & (HidNpadButton_AnyRight | HidNpadButton_A)) ? 1 : (d & HidNpadButton_AnyLeft) ? -1 : 0;
-        if (d & HidNpadButton_AnyUp)   { sel = (sel + n - 1) % n; redraw = true; }
-        if (d & HidNpadButton_AnyDown) { sel = (sel + 1) % n; redraw = true; }
-        if (dir) {
-            redraw = true;
-            switch (sel) {
-                case 0: g_settings.motion = (MotionSource)((g_settings.motion + MOTION_COUNT + dir) % MOTION_COUNT); break;
-                case 1: case 2: case 3: g_settings.invert[sel - 1] = !g_settings.invert[sel - 1]; break;
-                case 4:
-                    g_settings.gyro_scale += 0.25f * dir;
-                    if (g_settings.gyro_scale < 0.25f) g_settings.gyro_scale = 0.25f;
-                    if (g_settings.gyro_scale > 4.0f) g_settings.gyro_scale = 4.0f;
-                    break;
-                case 5: g_settings.low_latency = !g_settings.low_latency; break;
-                case 6: g_settings.xbox_layout = g_settings.xbox_layout == LAYOUT_LABEL ? LAYOUT_POSITION : LAYOUT_LABEL; break;
-                case 7: g_settings.autostart = !g_settings.autostart; break;
-            }
-        }
-        if (d & HidNpadButton_B) { settingsSave(); return; }
-        svcSleepThread(16000000ULL);
-    }
-    settingsSave();
-}
+// --------------------------------------------------------- worker thread ---
+typedef struct {
+    Mode mode;
+    volatile bool stop;          // UI -> worker
+    volatile bool started, done; // worker -> UI
+    volatile Result start_rc;
+    Mutex lock;
+    InputState in;               // latest input, for the visualizer
+    float quit_progress;
+} Worker;
+static Worker W;
 
-// ------------------------------------------------------------- running ------
 static Result mode_start(Mode m) {
     switch (m) {
         case MODE_SWITCH:  return proconInit();
@@ -177,98 +110,37 @@ static void mode_stop(Mode m) {
     }
 }
 
-static void line_status(bool ok, const char *good, const char *waiting) {
-    printf("\x1b[K  %s%s" C_RESET "\n", ok ? C_OK : C_WARN, ok ? good : waiting);
-}
-
-static void draw_run(Mode m, const InputState *in) {
-    logLock();
-    printf("\x1b[4;1H");
-    printf("\x1b[K  " C_ACCENT "%s" C_RESET "\n\x1b[K\n", k_mode_title[m]);
-    switch (m) {
-        case MODE_SWITCH: {
-            ProconStats p; proconGetStats(&p);
-            if (!proconIsConfigured()) line_status(false, "", "Plug the USB cable into the Switch 2 (or dock / PC).");
-            else line_status(proconIsStreaming(), "Connected - play!", "Connecting... (on the Switch 2: Pro Controller Wired Communication ON)");
-            printf("\x1b[K\n\x1b[K  Motion: %s\n", p.imu_source);
-            printf("\x1b[K\n\x1b[K  HOME    = hold Minus + click right stick\n");
-            printf("\x1b[K  Capture = hold Minus + click left stick\n");
-            break;
-        }
-        case MODE_XBOX:
-            line_status(xinputIsConfigured(), "Connected - play!", "Plug the USB cable into the PC.");
-            printf("\x1b[K\n\x1b[K  Guide button = hold Minus + click right stick\n\x1b[K\n");
-            break;
-        case MODE_GAMEPAD: case MODE_HIDTEST:
-            line_status(usbHidIsConfigured(), "Connected.", "Plug the USB cable into the computer.");
-            printf("\x1b[K\n\x1b[K\n\x1b[K\n");
-            break;
-        case MODE_VENDOR:
-            line_status(usbVendorIsConfigured(), "Connected to the receiver.", "Plug in and run: padlink_receiver.py --usb");
-            printf("\x1b[K\n\x1b[K\n\x1b[K\n");
-            break;
-        case MODE_WIFI: {
-            WifiStats w; wifiGetStats(&w);
-            if (w.peer_known) {
-                char t[96]; snprintf(t, sizeof t, "Connected to %s", w.peer_ip);
-                line_status(true, t, "");
-            } else line_status(false, "", "Looking for the PadLink receiver on your network...");
-            printf("\x1b[K\n\x1b[K  Round trip (measured): %.1f ms typical, %.1f ms worst of last 512\n",
-                   w.rtt_median_ms, w.rtt_max_ms);
-            printf("\x1b[K\n");
-            break;
-        }
-        default: break;
-    }
-    // small live input readout so you can see it reacting
-    printf("\x1b[22;1H\x1b[K" C_DIM "  Input: buttons %06llX   L %+6d %+6d   R %+6d %+6d" C_RESET "\n",
-           (unsigned long long)(in->buttons & 0xFFFFFF), in->ls.x, in->ls.y, in->rs.x, in->rs.y);
-    consoleUpdate(NULL);
-    logUnlock();
-}
-
-// Returns false if the app should exit (HOME > close).
-static bool run_mode(PadState *pad, Mode m) {
-    g_settings.last_mode = m;
-    settingsSave();
-    ui_header(k_mode_title[m]);
-    printf("\x1b[4;1H  Starting...\n");
-    ui_flush();
+static void worker_main(void *arg) {
+    (void)arg;
+    Mode m = W.mode;
     LOG("start mode %d (%s)", m, k_mode_title[m]);
     Result rc = mode_start(m);
+    W.start_rc = rc;
     if (R_FAILED(rc)) {
-        ui_header(k_mode_title[m]);
-        printf("\x1b[4;1H" C_WARN "  Couldn't start (error 0x%X)." C_RESET "\n\n", (unsigned)rc);
-        if (m == MODE_WIFI) printf("  Is the Switch connected to Wi-Fi?\n");
-        else printf("  Close DBI, Goldleaf, Tinfoil or anything else using USB, then try again.\n");
-        printf("\n  Details: sdmc:/switch/padlink/padlink.log\n");
-        ui_footer("Press B to go back");
-        ui_flush();
-        while (appletMainLoop()) {
-            padUpdate(pad);
-            if (padGetButtonsDown(pad) & HidNpadButton_B) break;
-            svcSleepThread(16000000ULL);
-        }
+        LOG_RC("mode start", rc);
         mode_stop(m);
-        return true;
+        W.done = true;
+        return;
     }
+    W.started = true;
 
-    ui_header(k_mode_title[m]);
-    ui_footer("Stop: hold + and - for 2 seconds.   Don't press HOME while playing.");
+    PadState pad;
+    padInitializeDefault(&pad);
     InputState in;
     PadlinkPacket pkt;
     u32 seq = 0;
-    bool dirty = true, keep_app = true;
-    u64 last_send = 0, last_draw = 0, quit_since = 0;
+    bool dirty = true;
+    u64 last_send = 0, last_share = 0, quit_since = 0;
     Result last_err = 0;
 
-    while (true) {
-        if (!appletMainLoop()) { keep_app = false; break; }
-        bool changed = inputRead(pad, &in);
+    while (!W.stop) {
+        bool changed = inputRead(&pad, &in);
         u64 t = now_us();
+        float qp = 0;
         if ((in.buttons & HidNpadButton_Plus) && (in.buttons & HidNpadButton_Minus)) {
             if (!quit_since) quit_since = t;
-            else if (t - quit_since > 2000000) break;
+            qp = (t - quit_since) / 2000000.0f;
+            if (qp >= 1.0f) break;
         } else quit_since = 0;
         dirty |= changed;
 
@@ -297,58 +169,282 @@ static bool run_mode(PadState *pad, Mode m) {
         if (R_FAILED(src) && src != last_err) LOG_RC("send", src);
         last_err = src;
 
-        if (t - last_draw >= 250000) { draw_run(m, &in); last_draw = now_us(); }
+        if (t - last_share >= 8000) {      // hand a copy to the UI ~120x/s
+            mutexLock(&W.lock);
+            W.in = in; W.quit_progress = qp;
+            mutexUnlock(&W.lock);
+            last_share = t;
+        }
         svcSleepThread(500000ULL);
     }
     mode_stop(m);
     LOG("stopped mode %d", m);
-    return keep_app;
+    W.done = true;
+}
+
+// ------------------------------------------------------------- run screen ---
+static const char *motion_label(const char *src) {
+    if (!src) return "Off";
+    if (!strcmp(src, "console")) return "Console motion sensor";
+    if (!strcmp(src, "controller")) return "Controller motion sensor";
+    if (!strncmp(src, "calibrating", 11)) return "Calibrating - keep still";
+    if (!strcmp(src, "none")) return "Motion off";
+    return src;
+}
+
+static void fill_run_view(Mode m, UiRun *v, char *stat, size_t stat_n, char *st, size_t st_n) {
+    v->title = k_mode_title[m]; v->icon = k_mode_icon[m]; v->accent = k_mode_accent[m];
+    mutexLock(&W.lock);
+    InputState in = W.in; v->quit_progress = W.quit_progress;
+    mutexUnlock(&W.lock);
+    v->buttons = (uint32_t)(in.buttons & 0xFFFF);   // UIB_* match HidNpadButton bits
+    v->lsx = in.ls.x; v->lsy = in.ls.y; v->rsx = in.rs.x; v->rsy = in.rs.y;
+    v->stat_text = stat; stat[0] = 0;
+    if (!W.started) { v->status = UI_ST_STARTING; v->status_text = "Starting..."; return; }
+
+    switch (m) {
+        case MODE_SWITCH: {
+            ProconStats p; proconGetStats(&p);
+            v->show_motion = true;
+            v->motion_text = motion_label(p.imu_source);
+            for (int i = 0; i < 3; i++) v->accel[i] = p.accel[i];
+            snprintf(stat, stat_n, "%u reports", (unsigned)p.reports);
+            if (!proconIsConfigured()) {
+                v->status = UI_ST_WAITING; v->status_text = "Plug in the USB cable";
+                v->lines[0] = "Connect to the Switch 2 (or its dock) with a\nUSB-C cable that carries data";
+                v->lines[1] = "On the Switch 2: Settings > Controllers & Accessories\n> Pro Controller Wired Communication: On";
+            } else if (!proconIsStreaming()) {
+                v->status = UI_ST_CONNECTING; v->status_text = "Connecting...";
+                v->lines[0] = "If this takes long, check that Pro Controller\nWired Communication is On on the Switch 2";
+            } else {
+                v->status = UI_ST_CONNECTED; v->status_text = "Connected - play!";
+                v->lines[0] = "HOME: hold - and click the right stick";
+                v->lines[1] = "Capture: hold - and click the left stick";
+                v->lines[2] = "Tilt goes the wrong way? Settings > Tilt axis";
+            }
+            break;
+        }
+        case MODE_XBOX:
+            snprintf(stat, stat_n, "%u reports", (unsigned)xinputReports());
+            if (xinputIsConfigured()) {
+                v->status = UI_ST_CONNECTED; v->status_text = "Connected - play!";
+                v->lines[0] = "Guide button: hold - and click the right stick";
+                v->lines[1] = "Face buttons by position or by label:\nchange it in Settings";
+            } else {
+                v->status = UI_ST_WAITING; v->status_text = "Plug the cable into the PC";
+                v->lines[0] = "Windows and Linux have the driver built in";
+                v->lines[1] = "Works with Steam and most PC games";
+            }
+            break;
+        case MODE_GAMEPAD: case MODE_HIDTEST:
+            snprintf(stat, stat_n, "%u reports", (unsigned)usbHidCompleted());
+            if (usbHidIsConfigured()) { v->status = UI_ST_CONNECTED; v->status_text = "Connected"; }
+            else { v->status = UI_ST_WAITING; v->status_text = "Plug the cable into the computer"; }
+            v->lines[0] = m == MODE_HIDTEST ? "Descriptors only: for checking USB stability"
+                                            : "Works on PC, Mac and Android without drivers";
+            break;
+        case MODE_VENDOR:
+            snprintf(stat, stat_n, "%u packets", (unsigned)usbVendorCompleted());
+            if (usbVendorIsConfigured()) { v->status = UI_ST_CONNECTED; v->status_text = "Connected to the receiver"; }
+            else { v->status = UI_ST_WAITING; v->status_text = "Plug in and start the receiver"; }
+            v->lines[0] = "On the PC: python padlink_receiver.py --usb";
+            break;
+        case MODE_WIFI: {
+            WifiStats w; wifiGetStats(&w);
+            if (w.peer_known) {
+                snprintf(st, st_n, "Connected to %s", w.peer_ip);
+                v->status = UI_ST_CONNECTED; v->status_text = st;
+                snprintf(stat, stat_n, "Round trip %.1f ms typical, %.1f ms worst", w.rtt_median_ms, w.rtt_max_ms);
+            } else {
+                v->status = UI_ST_WAITING; v->status_text = "Looking for the receiver...";
+            }
+            v->lines[0] = "Run PadLink Receiver on the PC\n(PadLink-PC-receiver.zip on the GitHub page)";
+            v->lines[1] = "Keep the Switch and the PC on the same network";
+            v->lines[2] = "Turn off Wi-Fi power saving on the PC";
+            break;
+        }
+        default: break;
+    }
+}
+
+static void error_screen(const char *title, const char *msg, const char *detail) {
+    UiError e = { title, msg, detail };
+    while (!s_quit_app) {
+        UiInput in = ui_poll();
+        if ((in.down & (HidNpadButton_B | HidNpadButton_A)) || in.tap) break;
+        ui_draw_error(&e);
+    }
+}
+
+static void run_mode(Mode m) {
+    g_settings.last_mode = m;
+    settingsSave();
+    memset(&W, 0, sizeof W);
+    mutexInit(&W.lock);
+    W.mode = m;
+    Thread th;
+    // Higher priority than the UI (0x2C); it sleeps 0.5 ms per loop so the UI still runs.
+    Result rc = threadCreate(&th, worker_main, NULL, NULL, 0x10000, 0x2B, -2);
+    if (R_SUCCEEDED(rc)) rc = threadStart(&th);
+    if (R_FAILED(rc)) { LOG_RC("worker thread", rc); error_screen("Couldn't start", "Internal error.", NULL); return; }
+
+    char stat[96], st[64];
+    u32 t0 = SDL_GetTicks();
+    while (!W.done) {
+        UiInput in = ui_poll();
+        if (s_quit_app) W.stop = true;
+        if (in.tap && ui_hit(in.tap_x, in.tap_y) == 0) W.stop = true;
+        UiRun v; memset(&v, 0, sizeof v);
+        fill_run_view(m, &v, stat, sizeof stat, st, sizeof st);
+        ui_draw_run(&v, SDL_GetTicks() - t0);
+    }
+    threadWaitForExit(&th);
+    threadClose(&th);
+
+    if (R_FAILED(W.start_rc)) {
+        char d[96];
+        snprintf(d, sizeof d, "Error 0x%X (%04d-%04d)  ·  log: sdmc:/switch/padlink/padlink.log",
+                 (unsigned)W.start_rc, 2000 + R_MODULE(W.start_rc), R_DESCRIPTION(W.start_rc));
+        if (m == MODE_WIFI) error_screen("Couldn't start Wi-Fi", "Is the Switch connected to a Wi-Fi network?", d);
+        else error_screen("Couldn't start USB", "Close DBI, Goldleaf, Tinfoil or anything else\nthat uses USB, then try again.", d);
+    }
+}
+
+// --------------------------------------------------------------- settings ---
+static void settings_screen(void) {
+    static const char *names[8] = { "Motion source", "Tilt axis X", "Tilt axis Y", "Tilt axis Z",
+                                    "Gyro sensitivity", "Latency", "Xbox face buttons", "Start automatically" };
+    static const char *help[8] = {
+        "Auto uses the controller's motion sensor if it has one (Joy-Cons),\notherwise the console's own sensor (Split Pad Pro).",
+        "Flip this if tilting goes the wrong way on this axis.",
+        "Flip this if tilting goes the wrong way on this axis.",
+        "Flip this if tilting goes the wrong way on this axis.",
+        "How strongly turning the Switch turns the camera.",
+        "Lowest sends a fresh report at every USB poll. Standard behaves exactly\nlike a real Pro Controller (8 ms). Use it if something acts up.",
+        "By position: the bottom button is always Xbox A.\nBy label: the Switch A button is Xbox A.",
+        "Skip the menu and start the last used mode right away.\nHold B while PadLink starts to get the menu back.",
+    };
+    int sel = 0;
+    while (!s_quit_app) {
+        char v[8][32];
+        const char *vals[8];
+        snprintf(v[0], 32, "%s", motionSourceName(g_settings.motion));
+        for (int i = 0; i < 3; i++) snprintf(v[1 + i], 32, "%s", g_settings.invert[i] ? "Inverted" : "Normal");
+        snprintf(v[4], 32, "%.2fx", g_settings.gyro_scale);
+        snprintf(v[5], 32, "%s", g_settings.low_latency ? "Lowest" : "Standard");
+        snprintf(v[6], 32, "%s", g_settings.xbox_layout == LAYOUT_LABEL ? "By label" : "By position");
+        snprintf(v[7], 32, "%s", g_settings.autostart ? "Last used mode" : "Off");
+        for (int i = 0; i < 8; i++) vals[i] = v[i];
+
+        UiList l = { "Settings", names, vals, help, 8, sel, NULL };
+        ui_draw_list(&l);
+
+        UiInput in = ui_poll();
+        int dir = (in.down & (HidNpadButton_AnyRight | HidNpadButton_A)) ? 1 : (in.down & HidNpadButton_AnyLeft) ? -1 : 0;
+        if (in.down & HidNpadButton_AnyUp)   sel = (sel + 7) % 8;
+        if (in.down & HidNpadButton_AnyDown) sel = (sel + 1) % 8;
+        if (in.tap) {
+            int h = ui_hit(in.tap_x, in.tap_y);
+            if (h == 9999) break;
+            if (h >= 2000) { sel = h - 2000; dir = 1; }
+            else if (h >= 1000) { sel = h - 1000; dir = -1; }
+            else if (h >= 0) { if (h == sel) dir = 1; sel = h; }
+        }
+        if (in.down & HidNpadButton_B) break;
+        if (dir) {
+            switch (sel) {
+                case 0: g_settings.motion = (MotionSource)((g_settings.motion + MOTION_COUNT + dir) % MOTION_COUNT); break;
+                case 1: case 2: case 3: g_settings.invert[sel - 1] = !g_settings.invert[sel - 1]; break;
+                case 4:
+                    g_settings.gyro_scale += 0.25f * dir;
+                    if (g_settings.gyro_scale < 0.25f) g_settings.gyro_scale = 0.25f;
+                    if (g_settings.gyro_scale > 4.0f) g_settings.gyro_scale = 4.0f;
+                    break;
+                case 5: g_settings.low_latency = !g_settings.low_latency; break;
+                case 6: g_settings.xbox_layout = g_settings.xbox_layout == LAYOUT_LABEL ? LAYOUT_POSITION : LAYOUT_LABEL; break;
+                case 7: g_settings.autostart = !g_settings.autostart; break;
+            }
+        }
+    }
+    settingsSave();
+}
+
+static void advanced_screen(void) {
+    static const char *names[2] = { "USB to PC receiver", "USB HID test" };
+    static const char *help[2] = {
+        "Sends to padlink_receiver.py --usb on a PC.\nNeeds the WinUSB driver on Windows.",
+        "Shows up as a USB device with no gamepad.\nFor troubleshooting USB crashes with other homebrew.",
+    };
+    int sel = 0;
+    while (!s_quit_app) {
+        UiList l = { "Advanced", names, NULL, help, 2, sel, NULL };
+        ui_draw_list(&l);
+        UiInput in = ui_poll();
+        if (in.down & (HidNpadButton_AnyUp | HidNpadButton_AnyDown)) sel ^= 1;
+        if (in.down & HidNpadButton_B) return;
+        int pick = (in.down & HidNpadButton_A) ? sel : -1;
+        if (in.tap) {
+            int h = ui_hit(in.tap_x, in.tap_y);
+            if (h == 9999) return;
+            if (h == 0 || h == 1) pick = h;
+        }
+        if (pick >= 0) { run_mode(pick == 0 ? MODE_VENDOR : MODE_HIDTEST); return; }
+    }
 }
 
 // ------------------------------------------------------------------- main ---
 int main(void) {
-    consoleInit(NULL);
     logOpen();
     logSetEcho(false);
     settingsLoad();
-    PadState pad;
-    inputInit(&pad);
 
-    // Autostart: go straight to the last mode unless B is held at launch.
-    padUpdate(&pad);
-    bool running = true;
-    if (g_settings.autostart && !(padGetButtons(&pad) & HidNpadButton_B) &&
-        g_settings.last_mode >= 0 && g_settings.last_mode <= MODE_WIFI)
-        running = run_mode(&pad, (Mode)g_settings.last_mode);
+    padConfigureInput(1, HidNpadStyleSet_NpadStandard);
+    padInitializeDefault(&s_pad);
+    hidInitializeTouchScreen();
 
-    static const char *main_items[] = {
-        "Switch 2 / Switch", "PC - Xbox controller", "PC / Mac - Generic gamepad", "PC - Wi-Fi",
-        "Settings", "Advanced", "Quit",
-    };
-    const char *main_help[] = {
-        k_mode_help[0], k_mode_help[1], k_mode_help[2], k_mode_help[3],
-        "Motion, tilt direction, sensitivity, latency, button layout, autostart.",
-        "Testing and troubleshooting tools.",
-        "Back to the homebrew menu.",
-    };
-
-    int sel = (g_settings.last_mode >= 0 && g_settings.last_mode <= MODE_WIFI) ? g_settings.last_mode : 0;
-    while (running) {
-        int c = ui_menu(&pad, "Use this Switch as a controller", main_items, main_help, 7, sel);
-        if (c < 0 || c == 6) break;
-        sel = c;
-        if (c <= 3) running = run_mode(&pad, (Mode)c);
-        else if (c == 4) settings_screen(&pad);
-        else if (c == 5) {
-            static const char *adv[] = { "USB to PC receiver", "USB HID crash test", "Back" };
-            const char *advh[] = { k_mode_help[MODE_VENDOR], k_mode_help[MODE_HIDTEST], NULL };
-            int a = ui_menu(&pad, "Advanced", adv, advh, 3, 0);
-            if (a == 0) running = run_mode(&pad, MODE_VENDOR);
-            else if (a == 1) running = run_mode(&pad, MODE_HIDTEST);
-        }
+    if (SDL_Init(SDL_INIT_VIDEO) < 0) { LOG("SDL_Init: %s", SDL_GetError()); logClose(); return 1; }
+    SDL_Window *win = SDL_CreateWindow("PadLink", 0, 0, UI_W, UI_H, 0);
+    SDL_Renderer *ren = win ? SDL_CreateRenderer(win, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC) : NULL;
+    PlFontData font = { 0 };
+    Result prc = plInitialize(PlServiceType_User);
+    if (R_SUCCEEDED(prc)) prc = plGetSharedFontByType(&font, PlSharedFontType_Standard);
+    if (!ren || R_FAILED(prc) || !ui_init(ren, font.address, font.size)) {
+        LOG("UI init failed: %s rc=0x%X", SDL_GetError(), (unsigned)prc);
+        SDL_Quit(); plExit(); logClose();
+        return 1;
     }
 
+    // Autostart: go straight to the last mode unless B is held at launch.
+    padUpdate(&s_pad);
+    if (g_settings.autostart && !(padGetButtons(&s_pad) & HidNpadButton_B) &&
+        g_settings.last_mode >= 0 && g_settings.last_mode <= MODE_WIFI)
+        run_mode((Mode)g_settings.last_mode);
+
+    int sel = (g_settings.last_mode >= 0 && g_settings.last_mode <= MODE_WIFI) ? g_settings.last_mode : 0;
+    while (!s_quit_app) {
+        UiHome h = { PADLINK_APP_VERSION, k_cards, 4, sel, NULL };
+        ui_draw_home(&h);
+        UiInput in = ui_poll();
+        // grid: 0 1 / 2 3 / 4 5 (Settings, Advanced)
+        if (in.down & HidNpadButton_AnyLeft)  sel = (sel % 2) ? sel - 1 : sel;
+        if (in.down & HidNpadButton_AnyRight) sel = (sel % 2) ? sel : sel + 1;
+        if (in.down & HidNpadButton_AnyUp)    sel = sel >= 2 ? sel - 2 : sel;
+        if (in.down & HidNpadButton_AnyDown)  sel = sel <= 3 ? sel + 2 : sel;
+        int act = (in.down & HidNpadButton_A) ? sel : -1;
+        if (in.down & HidNpadButton_Y) act = 4;
+        if (in.down & HidNpadButton_Plus) act = 6;
+        if (in.tap) { int t = ui_hit(in.tap_x, in.tap_y); if (t >= 0) { act = t; if (t < 6) sel = t; } }
+        if (act == 6) break;
+        if (act >= 0 && act < 4) run_mode((Mode)act);
+        else if (act == 4) settings_screen();
+        else if (act == 5) advanced_screen();
+    }
+
+    ui_exit();
+    SDL_DestroyRenderer(ren);
+    SDL_DestroyWindow(win);
+    SDL_Quit();
+    plExit();
     logClose();
-    consoleExit(NULL);
     return 0;
 }

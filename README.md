@@ -4,6 +4,8 @@
 <p align="center">Turn a modded Nintendo Switch into a USB controller for a <b>Switch 2</b>, a Switch, or a <b>PC</b>.<br>
 Use your Hori Split Pad Pro or Joy-Cons, with motion controls.</p>
 
+<p align="center"><img src="docs/screen_home.png" width="640" alt="PadLink home screen"></p>
+
 ---
 
 ## What it does
@@ -27,13 +29,15 @@ You need a Switch running Atmosphère (tested on firmware 16.0.2, Atmosphère 1.
 
 ## Use it
 
-1. Pick what you're plugging into from the menu.
+1. Pick what you're plugging into: tap a card or use the D-pad and **A**.
 2. Connect a USB-C cable from the Switch to the other device.
-3. Play. The screen shows **Connected**.
+3. Play. The screen turns green and shows **Connected**, with your buttons, sticks and tilt live on screen.
+
+<p align="center"><img src="docs/screen_run_switch.png" width="640" alt="PadLink running in Switch 2 mode"></p>
 
 | | |
 |---|---|
-| **Stop** | Hold **+** and **–** together for 2 seconds |
+| **Stop** | Hold **+** and **–** together for 2 seconds, or tap **Stop** |
 | **HOME** | Hold **–** and click the **right stick** |
 | **Capture** | Hold **–** and click the **left stick** |
 | **Motion** | Keep the Switch still for 1.5 s after starting. With a Split Pad Pro (it has no motion sensor) PadLink uses the console's own sensor, so you tilt the whole Switch. |

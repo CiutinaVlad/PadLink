@@ -40,7 +40,7 @@ include $(DEVKITPRO)/libnx/switch_rules
 TARGET		:=	padlink
 APP_TITLE	:=	PadLink
 APP_AUTHOR	:=	PadLink
-APP_VERSION	:=	1.0.0
+APP_VERSION	:=	1.1.0
 BUILD		:=	build
 SOURCES		:=	source
 DATA		:=	data
@@ -63,7 +63,7 @@ CXXFLAGS	:= $(CFLAGS) -fno-rtti -fno-exceptions
 ASFLAGS	:=	-g $(ARCH)
 LDFLAGS	=	-specs=$(DEVKITPRO)/libnx/switch.specs -g $(ARCH) -Wl,-Map,$(notdir $*.map)
 
-LIBS	:= -lnx
+LIBS	:= -lSDL2_ttf -lSDL2_gfx -lharfbuzz -lfreetype -lharfbuzz -lpng -lbz2 -lz -lSDL2 -lEGL -lglapi -ldrm_nouveau -lstdc++ -lm -lnx
 
 #---------------------------------------------------------------------------------
 # list of directories containing libraries, this must be the top level containing
